@@ -134,6 +134,18 @@ class YAMNetAudioClassifier:
         db_level = float(20.0 * np.log10(rms))
         db_level = max(-80.0, min(0.0, db_level))
 
+        # Frequency Analysis (Fast Fourier Transform)
+        fft_vals = np.abs(np.fft.rfft(audio))
+        freqs = np.fft.rfftfreq(len(audio), 1.0 / sr)
+        valid_idx = np.where((freqs >= 65.0) & (freqs <= 7500.0))[0]
+        if len(valid_idx) > 0 and db_level > -60.0:
+            peak_sub = np.argmax(fft_vals[valid_idx])
+            dominant_hz = round(float(freqs[valid_idx[peak_sub]]), 0)
+            centroid_hz = round(float(np.sum(freqs[valid_idx] * fft_vals[valid_idx]) / (np.sum(fft_vals[valid_idx]) + 1e-9)), 0)
+        else:
+            dominant_hz = 0.0
+            centroid_hz = 0.0
+
         # Quiet room gate: if sound is below -48 dB, it is normal quiet ambient
         if db_level < -48.0:
             return {
@@ -142,6 +154,10 @@ class YAMNetAudioClassifier:
                 "confidence": 0.98,
                 "threat_score": 0.05,
                 "db_level": round(db_level, 1),
+                "dominant_hz": 0.0,
+                "spectral_centroid_hz": 0.0,
+                "voice_detected": False,
+                "voice_status": "Silent / Ambient",
                 "top_predictions": [
                     {"class": "Silence", "prob": 0.98, "category": "Normal Ambient", "threat": 0.05, "color": "#00e5a3"},
                     {"class": "Inside, small room", "prob": 0.01, "category": "Normal Ambient", "threat": 0.05, "color": "#00e5a3"},
@@ -183,10 +199,25 @@ class YAMNetAudioClassifier:
         threat_candidates = [p["threat"] for p in top_preds if p["prob"] >= 0.12]
         threat_score = max(threat_candidates) if threat_candidates else best["threat"]
 
-        # Speech safety protection: if Speech is among the top detections, suppress false alarms
+        # Voice Activity Detection (VAD) & Human Speech Discrimination
         speech_prob = next((p["prob"] for p in top_preds if "Speech" in p["category"] or "Voice" in p["category"]), 0.0)
-        if speech_prob > 0.25 and threat_score < 0.90:
-            threat_score = 0.05
+        is_speech_class = speech_prob > 0.15 or ("Speech" in best["category"] or "Voice" in best["category"])
+        is_speech_pitch = (80.0 <= dominant_hz <= 420.0) and (250.0 <= centroid_hz <= 3400.0)
+        is_active_audio = db_level > -45.0
+
+        voice_detected = (is_speech_class or is_speech_pitch) and is_active_audio and (threat_score < 0.85)
+
+        if voice_detected:
+            voice_status = f"Human Voice Detected ({int(dominant_hz)} Hz)"
+            # Speech safety protection: if human voice is active, suppress false threat alarms
+            if threat_score < 0.90:
+                threat_score = 0.05
+        elif threat_score >= 0.70:
+            voice_status = f"Acoustic Threat: {best['class']} ({int(dominant_hz)} Hz)"
+        elif db_level > -48.0:
+            voice_status = f"Ambient Sound: {best['class']} ({int(dominant_hz)} Hz)"
+        else:
+            voice_status = "Silent / Inactive"
 
         return {
             "top_yamnet_class": best["class"],
@@ -194,6 +225,10 @@ class YAMNetAudioClassifier:
             "confidence": best["prob"],
             "threat_score": round(threat_score, 2),
             "db_level": round(db_level, 1),
+            "dominant_hz": dominant_hz,
+            "spectral_centroid_hz": centroid_hz,
+            "voice_detected": voice_detected,
+            "voice_status": voice_status,
             "top_predictions": top_preds,
             "inference_ms": inference_ms,
         }
@@ -223,6 +258,10 @@ class AudioStreamManager:
             "confidence": 0.98,
             "threat_score": 0.05,
             "db_level": -65.0,
+            "dominant_hz": 0.0,
+            "spectral_centroid_hz": 0.0,
+            "voice_detected": False,
+            "voice_status": "Silent / Ambient",
             "top_predictions": [],
             "inference_ms": 1.0,
         }
@@ -447,6 +486,19 @@ def index_page():
         </div>
       </div>
 
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+        <div style="background:#0f1520;border:1px solid var(--border);padding:14px;border-radius:8px;">
+          <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;">Dominant Pitch (Hz)</div>
+          <div style="font-size:24px;font-weight:700;color:#38bdf8;margin-top:4px;" id="hzVal">0 Hz</div>
+          <div style="font-size:11px;color:#64748b;margin-top:2px;" id="centroidVal">Centroid: 0 Hz</div>
+        </div>
+        <div style="background:#0f1520;border:1px solid var(--border);padding:14px;border-radius:8px;">
+          <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;">Voice Detection Status</div>
+          <div style="font-size:15px;font-weight:700;color:var(--accent);margin-top:8px;" id="voiceStatus">Silent / Ambient</div>
+          <div style="font-size:11px;color:#94a3b8;margin-top:4px;" id="vadPill">⚪ Inactive</div>
+        </div>
+      </div>
+
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
         <div style="background:#0f1520;border:1px solid var(--border);padding:14px;border-radius:8px;">
           <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;">Audio Threat Score</div>
@@ -496,6 +548,26 @@ setInterval(async () => {{
     document.getElementById('infMs').innerText = d.inference_ms + ' ms';
     document.getElementById('dbVal').innerText = d.db_level + ' dB';
     document.getElementById('topSound').innerText = d.top_yamnet_class + ' (' + d.surveillance_category + ')';
+
+    // Frequency and Voice Status
+    document.getElementById('hzVal').innerText = (d.dominant_hz || 0) + ' Hz';
+    document.getElementById('centroidVal').innerText = 'Centroid: ' + (d.spectral_centroid_hz || 0) + ' Hz';
+    document.getElementById('voiceStatus').innerText = d.voice_status || 'Silent / Ambient';
+    
+    const vp = document.getElementById('vadPill');
+    if (d.voice_detected) {{
+      vp.innerText = '🟢 Human Voice Active';
+      vp.style.color = '#10b981';
+      document.getElementById('voiceStatus').style.color = '#10b981';
+    }} else if (d.threat_score >= 0.70) {{
+      vp.innerText = '🚨 Threat Sound Active';
+      vp.style.color = '#ef4444';
+      document.getElementById('voiceStatus').style.color = '#ef4444';
+    }} else {{
+      vp.innerText = '⚪ Ambient Silence';
+      vp.style.color = '#94a3b8';
+      document.getElementById('voiceStatus').style.color = 'var(--accent)';
+    }}
 
     // Meter Bar
     const pct = Math.max(0, Math.min(100, ((d.db_level + 80) / 80) * 100));

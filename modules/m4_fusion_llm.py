@@ -129,6 +129,8 @@ def serialize_watchman_telemetry(
         "audio_category": audio_data.get("surveillance_category", "Normal Ambient"),
         "audio_confidence": round(float(audio_data.get("confidence", 0.98)), 2),
         "audio_db": round(float(audio_data.get("db_level", -60.0)), 1),
+        "audio_frequency_hz": round(float(audio_data.get("dominant_hz", 0.0)), 1),
+        "voice_detected": bool(audio_data.get("voice_detected", False)),
         "preliminary_threat_score": round(float(preliminary_threat), 2),
     }
 
@@ -558,6 +560,12 @@ def get_telemetry():
         "telemetry": LATEST_DISPATCH_STATE.get("telemetry", {}),
         "audio_db": a_data.get("db_level", -60.0),
         "top_sound": a_data.get("top_yamnet_class", "Silence"),
+        "audio_category": a_data.get("surveillance_category", "Normal Ambient"),
+        "dominant_hz": a_data.get("dominant_hz", 0.0),
+        "spectral_centroid_hz": a_data.get("spectral_centroid_hz", 0.0),
+        "voice_detected": a_data.get("voice_detected", False),
+        "voice_status": a_data.get("voice_status", "Silent / Ambient"),
+        "audio_source": a_data.get("source", "LIVE LAPTOP MICROPHONE"),
     }
 
 
@@ -699,7 +707,36 @@ def index_page():
       </div>
 
       <div class="card">
-        <div class="card-title">Watchman Acoustic Channel (Google YAMNet AudioSet)</div>
+        <div class="card-title">
+          <span>Watchman Acoustic Channel (Google YAMNet AudioSet)</span>
+          <span id="audioSrcLabel" style="color:var(--accent);">MIC</span>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px;">
+          <div style="background:#0d131f;border:1px solid var(--border);padding:10px;border-radius:6px;">
+            <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;">Dominant Pitch</div>
+            <div style="font-size:18px;font-weight:700;color:#38bdf8;margin-top:2px;" id="audioHz">0 Hz</div>
+            <div style="font-size:9px;color:#64748b;margin-top:2px;" id="audioCentroid">Centroid: 0 Hz</div>
+          </div>
+          <div style="background:#0d131f;border:1px solid var(--border);padding:10px;border-radius:6px;">
+            <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;">Voice Detection</div>
+            <div style="font-size:12px;font-weight:700;color:var(--accent);margin-top:4px;" id="voiceStatus">Silent / Ambient</div>
+            <div style="font-size:9px;color:#94a3b8;margin-top:2px;" id="vadPill">⚪ Inactive</div>
+          </div>
+          <div style="background:#0d131f;border:1px solid var(--border);padding:10px;border-radius:6px;">
+            <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;">Sound Level</div>
+            <div style="font-size:18px;font-weight:700;color:var(--accent);margin-top:2px;" id="audioDbVal">-60 dB</div>
+            <div style="background:#1e293b;height:4px;border-radius:2px;overflow:hidden;margin-top:4px;">
+              <div id="audioDbBar" style="background:#00e5a3;height:100%;width:20%;transition:width 0.1s;"></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="font-size:11px;color:#cbd5e1;background:#0d131f;border:1px solid var(--border);padding:8px 10px;border-radius:6px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">
+          <div><b>Acoustic Detection:</b> <span id="audioTopSound" style="color:var(--accent);font-weight:700;">Silence</span></div>
+          <div id="audioThreatPill" style="padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;background:#0f2922;color:#00e5a3;">NORMAL</div>
+        </div>
+
         <div class="controls-bar" style="margin-top:0;">
           <button class="btn btn-primary" onclick="switchAudio('mic')">🎙️ Live Laptop Mic</button>
           {audio_buttons}
@@ -769,6 +806,49 @@ setInterval(async () => {{
     document.getElementById('srcLabel').innerText = d.source;
     document.getElementById('jsonTelemetry').innerText = JSON.stringify(d.telemetry, null, 2);
     document.getElementById('dispatcherReasoning').innerText = d.llm_reasoning;
+
+    // Acoustic Channel updates
+    if (document.getElementById('audioHz')) {{
+      document.getElementById('audioSrcLabel').innerText = d.audio_source || 'MIC';
+      document.getElementById('audioHz').innerText = (d.dominant_hz || 0) + ' Hz';
+      document.getElementById('audioCentroid').innerText = 'Centroid: ' + (d.spectral_centroid_hz || 0) + ' Hz';
+      document.getElementById('audioDbVal').innerText = (d.audio_db || -60) + ' dB';
+      document.getElementById('audioTopSound').innerText = (d.top_sound || 'Silence') + ' (' + (d.audio_category || 'Normal') + ')';
+      document.getElementById('voiceStatus').innerText = d.voice_status || 'Silent / Ambient';
+
+      const dbPct = Math.max(0, Math.min(100, (((d.audio_db || -60) + 80) / 80) * 100));
+      document.getElementById('audioDbBar').style.width = dbPct + '%';
+
+      const vp = document.getElementById('vadPill');
+      if (d.voice_detected) {{
+        vp.innerText = '🟢 Human Voice Active';
+        vp.style.color = '#10b981';
+        document.getElementById('voiceStatus').style.color = '#10b981';
+      }} else if (d.audio_category && (d.audio_category.includes('Gunshot') || d.audio_category.includes('Scream') || d.audio_category.includes('Alarm') || d.audio_category.includes('Glass'))) {{
+        vp.innerText = '🚨 Threat Sound Active';
+        vp.style.color = '#ef4444';
+        document.getElementById('voiceStatus').style.color = '#ef4444';
+      }} else {{
+        vp.innerText = '⚪ Ambient Silence';
+        vp.style.color = '#94a3b8';
+        document.getElementById('voiceStatus').style.color = 'var(--accent)';
+      }}
+
+      const atp = document.getElementById('audioThreatPill');
+      if (d.audio_category && (d.audio_category.includes('Gunshot') || d.audio_category.includes('Glass') || d.audio_category.includes('Scream'))) {{
+        atp.innerText = 'CRITICAL';
+        atp.style.background = '#3b1111';
+        atp.style.color = '#ef4444';
+      }} else if (d.audio_category && d.audio_category.includes('Alarm')) {{
+        atp.innerText = 'WARNING';
+        atp.style.background = '#3d2406';
+        atp.style.color = '#f59e0b';
+      }} else {{
+        atp.innerText = 'NORMAL';
+        atp.style.background = '#0f2922';
+        atp.style.color = '#00e5a3';
+      }}
+    }}
 
     const tb = document.getElementById('threatBadge');
     if (d.fused_threat === 'CRITICAL') {{
