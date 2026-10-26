@@ -451,23 +451,52 @@ def video_feed():
 
 @app.get("/api/telemetry")
 def get_telemetry():
+    global LATEST_FUSION_STATE
     if STREAM is None or TRACKER is None or AUDIO_MGR is None:
         return JSONResponse({"status": "initializing"})
 
     pkt = STREAM.read()
     sfps = pkt.fps if pkt is not None else 0.0
+    state = TRACKER.get_latest_state()
+    raw_dets = state.detections if hasattr(state, "detections") else state[0]
+    vis_ms = state.inference_ms if hasattr(state, "inference_ms") else state[1]
+
+    frame = pkt.image if pkt is not None else None
+    fw = frame.shape[1] if frame is not None else 640
+    fh = frame.shape[0] if frame is not None else 480
+    b_data = BEHAVIOR.update(raw_dets, frame_w=fw, frame_h=fh)
     a_data = AUDIO_MGR.get_state()
+
+    # Rule evaluation (0.05ms)
+    yolo_data = {"detections": raw_dets, "vis_ms": vis_ms}
+    res = FUSION.evaluate(yolo_data, b_data, a_data)
+    LATEST_FUSION_STATE = res
+
+    # Record snapshot if elevated
+    if res.get("should_record", False) and frame is not None:
+        vis = draw_module2_hud(
+            frame=frame,
+            behavior_results=b_data,
+            zones=BEHAVIOR.zones,
+            source_label=STREAM.source_label,
+            stream_fps=sfps,
+            yolo_ms=vis_ms,
+        )
+        snap_name = f"rule_fusion_{int(time.time())}.jpg"
+        snap_path = SNAPSHOTS_DIR / snap_name
+        cv2.imwrite(str(snap_path), vis)
+        FUSION.log_incident(res, snapshot_path=f"/snapshots/{snap_name}")
 
     return {
         "source": STREAM.source_label,
         "stream_fps": sfps,
-        "rule_id": LATEST_FUSION_STATE.get("rule_id", "R17_SECURE_AMBIENT_BASELINE"),
-        "threat_level": LATEST_FUSION_STATE.get("threat_level", "NORMAL"),
-        "fused_score": LATEST_FUSION_STATE.get("fused_score", 0.05),
-        "final_action": LATEST_FUSION_STATE.get("final_action", "MONITOR_ONLY"),
-        "decision_reason": LATEST_FUSION_STATE.get("decision_reason", ""),
-        "fusion_latency_ms": LATEST_FUSION_STATE.get("fusion_latency_ms", 0.05),
-        "inputs_summary": LATEST_FUSION_STATE.get("inputs_summary", {}),
+        "rule_id": res["rule_id"],
+        "threat_level": res["threat_level"],
+        "fused_score": res["fused_score"],
+        "final_action": res["final_action"],
+        "decision_reason": res["decision_reason"],
+        "fusion_latency_ms": res["fusion_latency_ms"],
+        "inputs_summary": res["inputs_summary"],
         "audio_db": a_data.get("db_level", -60.0),
         "top_sound": a_data.get("top_yamnet_class", "Silence"),
         "audio_category": a_data.get("surveillance_category", "Normal Ambient"),
