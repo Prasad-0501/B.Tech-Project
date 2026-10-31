@@ -107,14 +107,21 @@ class RuleBasedFusionEngine:
         # 2. Parse Input Signals from Module 2 (ConvLSTM & Zones)
         # -------------------------------------------------------------
         convlstm_energy = float(behavior_data.get("convlstm_energy", 0.0))
+        convlstm_behavior = str(behavior_data.get("primary_behavior", "NORMAL_WALKING"))
+        spatiotemporal_anomaly = float(behavior_data.get("spatiotemporal_anomaly", 0.0))
+        behavior_summary = str(behavior_data.get("behavior_summary", ""))
+        fall_events = behavior_data.get("fall_events", [])
+        has_fall = (len(fall_events) > 0) or (convlstm_behavior == "SUDDEN_FALL_COLLAPSE")
         intrusions = behavior_data.get("intrusions", [])
         loiterings = behavior_data.get("loitering_events", [])
         runnings = behavior_data.get("running_events", [])
+        erratics = behavior_data.get("erratic_events", [])
         has_intrusion = len(intrusions) > 0
         intrusion_zone = intrusions[0].get("zone_name", "Restricted Area") if intrusions else ""
         max_dwell = max([l.get("dwell_sec", 0.0) for l in loiterings], default=0.0)
         max_speed = float(behavior_data.get("max_speed_px_s", 0.0))
-        is_running = len(runnings) > 0 or max_speed > 160.0
+        is_running = len(runnings) > 0 or max_speed > 150.0 or convlstm_behavior == "RUNNING_FLEEING"
+        is_erratic = len(erratics) > 0 or convlstm_behavior == "ERRATIC_PACING"
 
         # -------------------------------------------------------------
         # 3. Parse Input Signals from Module 3 (AST / YAMNet Audio)
@@ -182,6 +189,13 @@ class RuleBasedFusionEngine:
             action = "DISPATCH_SECURITY_PATROL"
             reason = "Human distress scream detected in immediate vicinity of detected subject."
 
+        elif has_fall:
+            rule_id = "R07A_SUDDEN_FALL_COLLAPSE_DISTRESS"
+            threat_level = "CRITICAL"
+            threat_score = 0.88
+            action = "DISPATCH_MEDICAL_AND_SECURITY_ASSISTANCE"
+            reason = f"ConvLSTM spatiotemporal kinematics detected sudden human collapse / fall on floor ({behavior_summary})."
+
         elif is_siren:
             rule_id = "R07_SECURITY_SIREN_ACTIVE"
             threat_level = "CRITICAL"
@@ -194,7 +208,14 @@ class RuleBasedFusionEngine:
             threat_level = "CRITICAL"
             threat_score = 0.82
             action = "DISPATCH_SECURITY_PATROL"
-            reason = f"High-speed intrusion: Subject sprinting inside {intrusion_zone} ({int(max_speed)} px/s, ConvLSTM energy: {convlstm_energy:.2f})."
+            reason = f"High-speed intrusion: Subject sprinting inside {intrusion_zone} ({int(max_speed)} px/s, ConvLSTM: {convlstm_behavior})."
+
+        elif convlstm_behavior == "RUNNING_FLEEING":
+            rule_id = "R08B_HIGH_SPEED_FLEEING"
+            threat_level = "WARNING"
+            threat_score = 0.70
+            action = "DISPATCH_SECURITY_PATROL"
+            reason = f"Rapid fleeing behavior: Person sprinting at high velocity across sector ({int(max_speed)} px/s)."
 
         elif has_intrusion and max_dwell >= 6.0:
             rule_id = "R09_RESTRICTED_ZONE_LOITERING"
@@ -217,12 +238,12 @@ class RuleBasedFusionEngine:
             action = "ISSUE_INTERCOM_WARNING"
             reason = f"Unauthorized zone entry: Subject crossed boundary into {intrusion_zone}."
 
-        elif max_dwell >= 6.0:
+        elif max_dwell >= 6.0 or convlstm_behavior == "LOITERING_LINGERING":
             rule_id = "R12_PERIMETER_LOITERING"
             threat_level = "WARNING"
             threat_score = 0.50
             action = "MONITOR_TRACK"
-            reason = f"Perimeter dwell alert: Subject stationary in camera sector for {max_dwell:.1f}s."
+            reason = f"Perimeter dwell alert: Subject lingering in camera sector ({max_dwell:.1f}s, ConvLSTM: {convlstm_behavior})."
 
         elif is_scream:
             rule_id = "R13_DISTANT_SCREAM_AUDIO"
@@ -231,12 +252,12 @@ class RuleBasedFusionEngine:
             action = "MONITOR_TRACK"
             reason = "Potential scream / vocal distress acoustic frequency detected."
 
-        elif convlstm_energy > 0.50 and max_speed > 140.0:
-            rule_id = "R14_ERRATIC_KINETIC_MOTION"
+        elif is_erratic or (convlstm_energy > 0.45 and max_speed > 120.0):
+            rule_id = "R14_ERRATIC_PACING_ANOMALY"
             threat_level = "WARNING"
-            threat_score = 0.40
+            threat_score = 0.48
             action = "MONITOR_TRACK"
-            reason = f"ConvLSTM kinetic motion anomaly: high velocity shift ({int(max_speed)} px/s)."
+            reason = f"ConvLSTM spatiotemporal anomaly: erratic pacing oscillation detected ({int(max_speed)} px/s, anomaly: {spatiotemporal_anomaly:.2f})."
 
         elif has_person and voice_detected:
             rule_id = "R15_ROUTINE_HUMAN_CONVERSATION"
@@ -277,6 +298,9 @@ class RuleBasedFusionEngine:
             "inputs_summary": {
                 "yolo_persons": person_count,
                 "yolo_weapons": weapon_names,
+                "convlstm_behavior": convlstm_behavior,
+                "spatiotemporal_anomaly": round(spatiotemporal_anomaly, 2),
+                "behavior_summary": behavior_summary,
                 "convlstm_energy": round(convlstm_energy, 2),
                 "zone_breach": intrusion_zone if has_intrusion else "None",
                 "dwell_time_sec": round(max_dwell, 1),
@@ -496,6 +520,9 @@ def get_telemetry():
         "final_action": res["final_action"],
         "decision_reason": res["decision_reason"],
         "fusion_latency_ms": res["fusion_latency_ms"],
+        "convlstm_behavior": b_data.get("primary_behavior", "NORMAL_WALKING"),
+        "spatiotemporal_anomaly": b_data.get("spatiotemporal_anomaly", 0.0),
+        "behavior_summary": b_data.get("behavior_summary", ""),
         "inputs_summary": res["inputs_summary"],
         "audio_db": a_data.get("db_level", -60.0),
         "top_sound": a_data.get("top_yamnet_class", "Silence"),

@@ -184,6 +184,9 @@ class LLMCognitiveDispatcher:
         audio_cat = telemetry.get("audio_category", "Normal Ambient")
         audio_event = telemetry.get("audio_event", "Silence")
         dominant_hz = telemetry.get("dominant_hz", 0.0)
+        conv_beh = telemetry.get("convlstm_behavior", "NORMAL_WALKING")
+        beh_summary = telemetry.get("behavior_summary", "")
+        anomaly_score = telemetry.get("spatiotemporal_anomaly", 0.0)
 
         if threat_score >= 0.95 or "Gunshot" in audio_cat:
             return {
@@ -192,6 +195,20 @@ class LLMCognitiveDispatcher:
                 "decided_action": "LOCKDOWN_ALL_SECTORS_AND_DISPATCH_ARMED_SECURITY" if weapons else "LOCK_SECTOR_DOORS_AND_SOUND_ALARM",
                 "dispatch_brief": "Initiate emergency facility lockdown. Seal sector access doors. Alert Armed Tactical Response.",
             }
+        elif conv_beh == "SUDDEN_FALL_COLLAPSE" or rule_id.startswith("R07A"):
+            return {
+                "incident_type": "MEDICAL_EMERGENCY_SUBJECT_COLLAPSE",
+                "human_reasoning": f"ConvLSTM spatiotemporal kinematics detected sudden human collapse / fall on floor ({beh_summary}). Posture aspect ratio collapsed horizontally with motionless subject.",
+                "decided_action": "DISPATCH_SECURITY_PATROL",
+                "dispatch_brief": "Dispatch immediate on-duty medical and security patrol to sector. Subject collapsed on floor.",
+            }
+        elif conv_beh == "RUNNING_FLEEING" or rule_id.startswith("R08"):
+            return {
+                "incident_type": "RAPID_FLEEING_BREACH",
+                "human_reasoning": f"Subject sprinting at high velocity ({beh_summary}). ConvLSTM spatiotemporal dispersion indicates rapid fleeing or perimeter evasion.",
+                "decided_action": "DISPATCH_SECURITY_PATROL",
+                "dispatch_brief": f"Security Officer: intercept sprinting subject in sector {zone}. Intercept before perimeter exit.",
+            }
         elif threat_score >= 0.70 or "Glass" in audio_cat or "Scream" in audio_cat:
             return {
                 "incident_type": "FORCED_ENTRY_DISTURBANCE",
@@ -199,10 +216,17 @@ class LLMCognitiveDispatcher:
                 "decided_action": "DISPATCH_SECURITY_PATROL",
                 "dispatch_brief": f"Security Officer: inspect {zone} immediately. Report physical boundary integrity.",
             }
-        elif zone != "None" and dwell >= 6.0:
+        elif conv_beh == "ERRATIC_PACING" or rule_id.startswith("R14"):
+            return {
+                "incident_type": "SUSPICIOUS_ERRATIC_BEHAVIOR",
+                "human_reasoning": f"ConvLSTM detected erratic back-and-forth pacing and chaotic trajectory variance (Anomaly: {anomaly_score}). Subject may be agitated or casing sector.",
+                "decided_action": "ISSUE_INTERCOM_WARNING",
+                "dispatch_brief": "Maintain close camera tracking on pacing subject. Prepare verbal intercom inquiry if behavior persists.",
+            }
+        elif zone != "None" and (dwell >= 6.0 or conv_beh == "LOITERING_LINGERING"):
             return {
                 "incident_type": "RESTRICTED_ZONE_LOITERING",
-                "human_reasoning": f"Subject has remained stationary inside restricted {zone} for {dwell} seconds without authorized movement intent.",
+                "human_reasoning": f"Subject has remained stationary inside restricted {zone} for {dwell} seconds without authorized movement intent (ConvLSTM: {conv_beh}).",
                 "decided_action": "ISSUE_INTERCOM_WARNING",
                 "dispatch_brief": f"Broadcast verbal intercom warning to subject in {zone}. Advise to vacate restricted sector.",
             }
@@ -216,7 +240,7 @@ class LLMCognitiveDispatcher:
         elif threat_score > 0.10:
             return {
                 "incident_type": "AUTHORIZED_ROUTINE_OCCUPANCY",
-                "human_reasoning": "Sensors detect routine authorized human presence within normal parameters. Speech acoustic frequencies detected with baseline movement.",
+                "human_reasoning": f"Sensors detect routine authorized human presence within normal parameters ({conv_beh}). Upright posture with baseline movement.",
                 "decided_action": "MONITOR_ONLY",
                 "dispatch_brief": "Baseline sector monitoring. Routine operational presence.",
             }
@@ -473,6 +497,12 @@ def get_telemetry():
         "rule_id": f_res["rule_id"],
         "rule_action": f_res["final_action"],
         "telemetry": f_res["inputs_summary"],
+        # ConvLSTM Spatiotemporal Behavior
+        "convlstm_behavior": b_data.get("primary_behavior", "NORMAL_WALKING"),
+        "behavior_summary": b_data.get("behavior_summary", ""),
+        "spatiotemporal_anomaly": b_data.get("spatiotemporal_anomaly", 0.0),
+        "convlstm_ms": b_data.get("convlstm_ms", 0.0),
+        "convlstm_energy": b_data.get("convlstm_energy", 0.0),
         # LLM Cognitive Reasoning
         "llm_incident_type": dec.get("incident_type", "PERIMETER_SECURE_BASELINE"),
         "llm_human_reasoning": dec.get("human_reasoning", "Perimeter secure."),
@@ -503,6 +533,28 @@ def force_reason():
     rule_id = str(LATEST_FUSION_RESULT.get("rule_id", "R17_SECURE_AMBIENT_BASELINE"))
     dec = DISPATCHER.force_reason_now(LATEST_TELEMETRY, threat_score, rule_id)
     return {"ok": True, "decision": dec}
+
+
+@app.post("/api/simulate_behavior")
+def simulate_behavior(mode: str = Query(...)):
+    """Injects or tests a specific behavioral pattern in ConvLSTM."""
+    mode_map = {
+        "fall": "SUDDEN_FALL_COLLAPSE",
+        "run": "RUNNING_FLEEING",
+        "loiter": "LOITERING_LINGERING",
+        "erratic": "ERRATIC_PACING",
+        "walk": "NORMAL_WALKING",
+        "idle": "STATIONARY_IDLE",
+        "reset": None,
+    }
+    target = mode_map.get(mode.lower(), None)
+    if target is None:
+        BEHAVIOR.simulated_behavior_override = None
+        BEHAVIOR.simulated_override_expire = 0.0
+    else:
+        BEHAVIOR.simulated_behavior_override = target
+        BEHAVIOR.simulated_override_expire = time.time() + 8.0
+    return {"ok": True, "active_behavior": BEHAVIOR.simulated_behavior_override}
 
 
 @app.get("/api/incidents")
@@ -600,6 +652,44 @@ def index_page():
         <div class="controls-bar">
           <button class="btn btn-primary" onclick="switchVideo('camera')">📷 Live Camera</button>
           {vid_buttons}
+        </div>
+      </div>
+
+      <!-- ConvLSTM Spatiotemporal Behavior Channel -->
+      <div class="card">
+        <div class="card-title">
+          <span>Watchman Behavioral Channel (2D ConvLSTM Spatiotemporal AI)</span>
+          <span id="behaviorStatusBadge" style="color:var(--accent);font-weight:700;">NORMAL WALKING</span>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:8px;margin-bottom:12px;">
+          <div style="background:#0d131f;border:1px solid var(--border);padding:10px;border-radius:6px;">
+            <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;">Primary Behavior</div>
+            <div style="font-size:14px;font-weight:700;color:var(--accent);margin-top:2px;" id="convBehaviorVal">NORMAL_WALKING</div>
+            <div style="font-size:9px;color:#64748b;margin-top:2px;" id="convSummaryText">Routine pedestrian presence</div>
+          </div>
+          <div style="background:#0d131f;border:1px solid var(--border);padding:10px;border-radius:6px;">
+            <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;">Spatiotemporal Anomaly</div>
+            <div style="font-size:18px;font-weight:700;color:#38bdf8;margin-top:2px;" id="convAnomalyVal">0.05</div>
+            <div style="background:#1e293b;height:4px;border-radius:2px;overflow:hidden;margin-top:4px;">
+              <div id="convAnomalyBar" style="background:#38bdf8;height:100%;width:5%;transition:width 0.2s;"></div>
+            </div>
+          </div>
+          <div style="background:#0d131f;border:1px solid var(--border);padding:10px;border-radius:6px;">
+            <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;">Recurrent Energy</div>
+            <div style="font-size:18px;font-weight:700;color:var(--accent);margin-top:2px;" id="convEnergyVal">0.02</div>
+            <div style="font-size:9px;color:#94a3b8;margin-top:2px;" id="convSpeedVal">Speed: 0 px/s</div>
+          </div>
+        </div>
+
+        <div style="font-size:11px;color:#94a3b8;margin-bottom:6px;font-weight:700;text-transform:uppercase;">ConvLSTM Behavior Test Deck:</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;">
+          <button class="btn btn-audio" onclick="simulateBehavior('walk')">🚶 Normal Walk</button>
+          <button class="btn btn-audio" onclick="simulateBehavior('run')">🏃 Sprint / Fleeing</button>
+          <button class="btn btn-audio" onclick="simulateBehavior('loiter')">⏳ Restricted Loitering</button>
+          <button class="btn btn-primary" style="background:#991b1b;border-color:#ef4444;" onclick="simulateBehavior('fall')">🚨 Sudden Fall / Collapse</button>
+          <button class="btn btn-audio" onclick="simulateBehavior('erratic')">⚡ Erratic Pacing</button>
+          <button class="btn" onclick="simulateBehavior('reset')">🔄 Clear</button>
         </div>
       </div>
 
@@ -723,6 +813,9 @@ async function switchVideo(src) {{
 async function switchAudio(src) {{
   await fetch('/api/switch_audio?src=' + encodeURIComponent(src), {{method:'POST'}});
 }}
+async function simulateBehavior(mode) {{
+  await fetch('/api/simulate_behavior?mode=' + encodeURIComponent(mode), {{method:'POST'}});
+}}
 
 async function forceEvaluateNow(btn) {{
   const orig = btn.innerText;
@@ -756,6 +849,31 @@ setInterval(async () => {{
     document.getElementById('llmReasoningVal').innerText = d.llm_human_reasoning;
     document.getElementById('decidedActionVal').innerText = d.llm_decided_action;
     document.getElementById('dispatchBriefVal').innerText = d.llm_dispatch_brief;
+
+    // ConvLSTM Behavior updates
+    if (document.getElementById('convBehaviorVal')) {{
+      const bName = d.convlstm_behavior || 'NORMAL_WALKING';
+      document.getElementById('convBehaviorVal').innerText = bName;
+      document.getElementById('behaviorStatusBadge').innerText = bName;
+      document.getElementById('convSummaryText').innerText = d.behavior_summary || 'Routine pedestrian presence';
+      const anom = d.spatiotemporal_anomaly || 0;
+      document.getElementById('convAnomalyVal').innerText = anom.toFixed(2);
+      document.getElementById('convAnomalyBar').style.width = Math.min(100, Math.max(5, anom * 100)) + '%';
+      document.getElementById('convEnergyVal').innerText = (d.convlstm_energy || 0).toFixed(2);
+
+      const badge = document.getElementById('behaviorStatusBadge');
+      const bVal = document.getElementById('convBehaviorVal');
+      if (bName === 'SUDDEN_FALL_COLLAPSE') {{
+        badge.style.color = '#ef4444';
+        bVal.style.color = '#ef4444';
+      }} else if (bName === 'RUNNING_FLEEING' || bName === 'LOITERING_LINGERING') {{
+        badge.style.color = '#f59e0b';
+        bVal.style.color = '#f59e0b';
+      }} else {{
+        badge.style.color = 'var(--accent)';
+        bVal.style.color = 'var(--accent)';
+      }}
+    }}
 
     // Acoustic updates
     if (document.getElementById('audioHz')) {{

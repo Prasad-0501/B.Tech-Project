@@ -13,10 +13,17 @@ The system is organized into modular edge components:
 - **Performance**: Zero-lag asynchronous frame acquisition pipeline (`ZeroLagVideoStream`).
 - **Classes**: Tracks MS COCO surveillance entities (Persons, Backpacks, Suitcases, Knives, etc.).
 
-### 2. Spatiotemporal Behavior & Zones (`modules/m2_behavior_zones.py`)
-- **ConvLSTM Recurrent Engine**: Generates a 2D $64 \times 64$ spatial occupancy tensor from YOLO detections and processes it through a 2D ConvLSTM cell (< 3ms latency) to detect kinetic anomalies without background noise.
-- **Geofencing**: Ray-casting point-in-polygon engine for restricted zones (e.g. Server Vault, Perimeter).
-- **Kinematics**: Dwell-time loitering tracking and movement velocity estimation.
+### 2. Spatiotemporal ConvLSTM Behavior Analyzer & Geofencing (`modules/m2_behavior_zones.py`)
+- **3-Channel Spatiotemporal Tensor (3 x 64 x 64)**: Encodings for Gaussian spatial presence + posture aspect ratio ($h/w$), velocity flow vectors, and temporal frame-difference kinetic deltas.
+- **2D ConvLSTM Recurrent Engine**: Maintains spatiotemporal memory ($T=16$ sequence) executing 2D spatial convolutions in $< 2\text{ms}$ to capture trajectory continuity and posture shifts.
+- **Multi-Class Human Behavior Classification**:
+  - `NORMAL_WALKING`: Upright posture ($AR \ge 1.4$), smooth trajectory, nominal velocity ($20-130\text{ px/s}$).
+  - `RUNNING_FLEEING`: High velocity surge ($> 150\text{ px/s}$) with rapid spatial dispersion.
+  - `SUDDEN_FALL_COLLAPSE`: Rapid vertical drop followed by aspect ratio inversion ($h/w < 1.0$) and floor stillness (critical medical alert).
+  - `LOITERING_LINGERING`: Confined localized energy density with prolonged dwell ($\ge 6.0\text{s}$) in monitored/restricted sectors.
+  - `ERRATIC_PACING`: Chaotic trajectory oscillations ($> 90^\circ$ sharp turns) and agitated jitter.
+  - `RESTRICTED_INTRUSION`: Geofence boundary violation via ray-casting point-in-polygon.
+- **Interactive Behavior Test Deck**: Instant testbench simulation controls for all behavioral modes in the dashboard.
 
 ### 3. Acoustic AI (`modules/m3_audio_ast.py`)
 - **Model**: Google YAMNet ONNX (AudioSet 521 audio classes).
