@@ -553,7 +553,7 @@ def simulate_behavior(mode: str = Query(...)):
         BEHAVIOR.simulated_override_expire = 0.0
     else:
         BEHAVIOR.simulated_behavior_override = target
-        BEHAVIOR.simulated_override_expire = time.time() + 8.0
+        BEHAVIOR.simulated_override_expire = time.time() + 30.0
     return {"ok": True, "active_behavior": BEHAVIOR.simulated_behavior_override}
 
 

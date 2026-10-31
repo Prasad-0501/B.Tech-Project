@@ -569,6 +569,14 @@ class YOLOConvLSTMBehaviorAnalyzer:
             primary_behavior = self.simulated_behavior_override
             behavior_summary = f"[TEST SIMULATION] {primary_behavior}"
             behavior_confidence = 0.95
+            if primary_behavior == "SUDDEN_FALL_COLLAPSE" and not fall_events:
+                fall_events.append({"track_id": 1, "aspect_ratio": 0.65})
+            elif primary_behavior == "RUNNING_FLEEING" and not running_events:
+                running_events.append({"track_id": 1, "speed_px_s": 195.0})
+            elif primary_behavior == "LOITERING_LINGERING" and not loitering_events:
+                loitering_events.append({"track_id": 1, "dwell_sec": 12.5})
+            elif primary_behavior == "ERRATIC_PACING" and not erratic_events:
+                erratic_events.append({"track_id": 1, "speed_px_s": 95.0})
         elif len(fall_events) > 0:
             primary_behavior = "SUDDEN_FALL_COLLAPSE"
             behavior_summary = f"Subject #{fall_events[0]['track_id']} collapsed on floor (Aspect Ratio: {fall_events[0]['aspect_ratio']})"
@@ -903,7 +911,7 @@ def simulate_behavior(mode: str = Query(...)):
         ANALYZER.simulated_override_expire = 0.0
     else:
         ANALYZER.simulated_behavior_override = target
-        ANALYZER.simulated_override_expire = time.time() + 8.0  # Active for 8 seconds
+        ANALYZER.simulated_override_expire = time.time() + 30.0  # Active for 30 seconds
 
     return {"ok": True, "active_behavior": ANALYZER.simulated_behavior_override}
 
