@@ -1,6 +1,6 @@
 # 🛡️ SmartGuard: Multi-Modal Edge AI Surveillance System
 
-An intelligent, multi-modal edge surveillance system designed for low-latency on-device processing (targeting Raspberry Pi 4/5 and local edge hardware).
+An intelligent, multi-modal on-premises building and residential surveillance system designed for real-time edge processing on security workstations, laptops, and dedicated on-premises edge servers.
 
 ---
 

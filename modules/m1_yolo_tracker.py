@@ -614,7 +614,7 @@ MODULE 1: Real-Time YOLOv8 Object Detection & Multi-Object Tracking Engine (tune
 Dataset Backbone : MS COCO 2017 (80 classes, filtered to surveillance targets)
                    Custom fine-tuned models (any class list) are auto-detected.
 Model            : Ultralytics YOLOv8/YOLO11 + ByteTrack
-Targets          : Laptop GPU (.pt / TensorRT .engine) and Raspberry Pi (NCNN / ONNX)
+Targets          : Laptop / Workstation GPU (.pt / TensorRT), Edge Servers (PyTorch / ONNX)
 
 Pipeline         : 1. ZeroLagVideoStream  - background grabber, latest-frame-only
                    2. YOLOTrackerEngine   - async detection + tracking thread

@@ -520,7 +520,7 @@ def index_page():
   <div class="header">
     <div>
       <h1>MODULE 3: Acoustic Anomaly Detection Engine (Google YAMNet Deep Learning AI)</h1>
-      <div style="font-size:12px;color:#94a3b8;margin-top:2px;">Trained on Google AudioSet (2M+ clips, 521 classes) • ONNX Runtime • ARM / Raspberry Pi Optimized (~12ms)</div>
+      <div style="font-size:12px;color:#94a3b8;margin-top:2px;">Trained on Google AudioSet (2M+ clips, 521 classes) • High-Performance ONNX Runtime • Low-Latency Edge Inference (~12ms)</div>
     </div>
     <span class="badge badge-safe" id="threatBadge">NORMAL AMBIENT</span>
   </div>
