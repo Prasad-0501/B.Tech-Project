@@ -110,6 +110,10 @@ class RuleBasedFusionEngine:
         convlstm_behavior = str(behavior_data.get("primary_behavior", "NORMAL_WALKING"))
         spatiotemporal_anomaly = float(behavior_data.get("spatiotemporal_anomaly", 0.0))
         behavior_summary = str(behavior_data.get("behavior_summary", ""))
+        theft_events = behavior_data.get("theft_events", [])
+        fight_events = behavior_data.get("fight_events", [])
+        has_theft = (len(theft_events) > 0) or (convlstm_behavior == "THEFT_SNATCHING_ROBBERY")
+        has_fight = (len(fight_events) > 0) or (convlstm_behavior == "PHYSICAL_STRUGGLE_FIGHT")
         fall_events = behavior_data.get("fall_events", [])
         has_fall = (len(fall_events) > 0) or (convlstm_behavior == "SUDDEN_FALL_COLLAPSE")
         intrusions = behavior_data.get("intrusions", [])
@@ -160,6 +164,22 @@ class RuleBasedFusionEngine:
             threat_score = 0.98
             action = "LOCK_SECTOR_DOORS_AND_SOUND_ALARM"
             reason = f"Gunshot / Explosive acoustic detonation confirmed by YAMNet ({audio_class}, {audio_db:.1f} dB)."
+
+        elif has_theft:
+            rule_id = "R02B_THEFT_SNATCHING_ROBBERY"
+            threat_level = "CRITICAL"
+            threat_score = 0.94
+            action = "ALERT_SECURITY_THEFT_IN_PROGRESS_AND_INTERCEPT_FLEEING_SUSPECT"
+            theft_note = theft_events[0].get("details", "") if theft_events else behavior_summary
+            reason = f"ConvLSTM multi-agent spatiotemporal kinematics detected theft/snatching in progress: {theft_note}."
+
+        elif has_fight:
+            rule_id = "R02C_PHYSICAL_ALTERCATION_FIGHT"
+            threat_level = "CRITICAL"
+            threat_score = 0.90
+            action = "DISPATCH_SECURITY_PATROL_PHYSICAL_ALTERCATION"
+            fight_note = fight_events[0].get("details", "") if fight_events else behavior_summary
+            reason = f"ConvLSTM detected violent physical struggle / altercation between subjects: {fight_note}."
 
         elif has_weapon and has_intrusion:
             rule_id = "R03_ARMED_ZONE_INTRUSION"

@@ -167,13 +167,15 @@ class YOLOConvLSTMBehaviorAnalyzer:
     """
 
     BEHAVIOR_CLASSES = [
+        "THEFT_SNATCHING_ROBBERY",
+        "PHYSICAL_STRUGGLE_FIGHT",
+        "SUDDEN_FALL_COLLAPSE",
+        "RUNNING_FLEEING",
+        "LOITERING_LINGERING",
+        "RESTRICTED_INTRUSION",
+        "ERRATIC_PACING",
         "NORMAL_WALKING",
         "STATIONARY_IDLE",
-        "LOITERING_LINGERING",
-        "RUNNING_FLEEING",
-        "SUDDEN_FALL_COLLAPSE",
-        "ERRATIC_PACING",
-        "RESTRICTED_INTRUSION",
         "SCENE_EMPTY_SECURE",
     ]
 
@@ -203,6 +205,17 @@ class YOLOConvLSTMBehaviorAnalyzer:
 
         # Fall event latch to preserve alert state over consecutive frames
         self.fall_latches: Dict[int, float] = {}
+
+        # Multi-person pairwise interaction memory (Theft, Snatching, Fight)
+        # pair_key: (min_tid, max_tid) -> dict
+        self.pair_interactions: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        self.recent_contact_hotspots: deque = deque(maxlen=30)
+        self.theft_latch_until: float = 0.0
+        self.theft_event_details: str = ""
+        self.fight_latch_until: float = 0.0
+        self.fight_event_details: str = ""
+        self.active_theft_pair: Optional[Tuple[int, int]] = None
+        self.active_fight_pair: Optional[Tuple[int, int]] = None
 
         # Manual test simulation mode (allows evaluator to test specific behaviors)
         self.simulated_behavior_override: Optional[str] = None
@@ -449,18 +462,162 @@ class YOLOConvLSTMBehaviorAnalyzer:
             "anomaly_score": round(anomaly_score, 2),
         }
 
+    def evaluate_multi_person_interactions(
+        self,
+        persons: List[Dict[str, Any]],
+        items: List[Dict[str, Any]],
+        now: float,
+        frame_w: int,
+        frame_h: int,
+    ) -> Tuple[bool, str, bool, str, List[Dict[str, Any]]]:
+        """
+        Evaluates multi-agent spatiotemporal interactions to detect:
+          1. Theft / Phone / Bag Snatching (Approach -> Contact Scuffle -> Escape Sprint)
+          2. Physical Altercation / Brawl / Fight (Sustained close contact with violent agitation)
+        """
+        is_theft = False
+        theft_details = ""
+        is_fight = False
+        fight_details = ""
+        interaction_links = []
+
+        # Adaptive contact threshold based on resolution
+        contact_dist_thresh = max(120.0, min(frame_w, frame_h) * 0.35)
+
+        # Check all pairs of tracked persons
+        for i in range(len(persons)):
+            for j in range(i + 1, len(persons)):
+                p1 = persons[i]
+                p2 = persons[j]
+                tid1, tid2 = min(p1["track_id"], p2["track_id"]), max(p1["track_id"], p2["track_id"])
+                pair_key = (tid1, tid2)
+
+                c1 = p1["centroid"]
+                c2 = p2["centroid"]
+                dist = math.hypot(c1[0] - c2[0], c1[1] - c2[1])
+
+                b1 = p1["bbox"]
+                b2 = p2["bbox"]
+                x_overlap = max(0, min(b1[2], b2[2]) - max(b1[0], b2[0]))
+                y_overlap = max(0, min(b1[3], b2[3]) - max(b1[1], b2[1]))
+                has_bbox_overlap = (x_overlap > 0) and (y_overlap > 0)
+                
+                # Check proximity gap
+                x_gap = max(0, max(b1[0], b2[0]) - min(b1[2], b2[2]))
+                y_gap = max(0, max(b1[1], b2[1]) - min(b1[3], b2[3]))
+                bbox_proximity = (x_gap < 30) and (y_gap < 30)
+
+                in_contact = (dist <= contact_dist_thresh) or has_bbox_overlap or bbox_proximity
+
+                v1 = float(p1.get("speed_px_s", 0.0))
+                v2 = float(p2.get("speed_px_s", 0.0))
+                max_v = max(v1, v2)
+
+                interaction_links.append({
+                    "pair": (tid1, tid2),
+                    "c1": c1,
+                    "c2": c2,
+                    "distance": round(dist, 1),
+                    "in_contact": in_contact,
+                    "max_speed": round(max_v, 1),
+                })
+
+                if in_contact:
+                    mid_pt = ((c1[0] + c2[0]) / 2.0, (c1[1] + c2[1]) / 2.0)
+                    self.recent_contact_hotspots.append({
+                        "loc": mid_pt,
+                        "time": now,
+                        "peak_v": max_v,
+                        "p1_tid": tid1,
+                        "p2_tid": tid2,
+                    })
+
+                    if pair_key not in self.pair_interactions:
+                        self.pair_interactions[pair_key] = {
+                            "first_contact": now,
+                            "last_contact": now,
+                            "peak_contact_speed": max_v,
+                            "scuffle_ticks": 1 if max_v > 100.0 else 0,
+                            "had_scuffle": max_v > 100.0,
+                        }
+                    else:
+                        entry = self.pair_interactions[pair_key]
+                        entry["last_contact"] = now
+                        if max_v > entry["peak_contact_speed"]:
+                            entry["peak_contact_speed"] = max_v
+                        if max_v > 100.0:
+                            entry["scuffle_ticks"] += 1
+                            entry["had_scuffle"] = True
+
+                        contact_dur = now - entry["first_contact"]
+                        if contact_dur >= 1.0 and entry["scuffle_ticks"] >= 4 and v1 > 35.0 and v2 > 35.0:
+                            is_fight = True
+                            self.fight_latch_until = now + 4.5
+                            self.fight_event_details = f"Physical Altercation: Subjects #{tid1} and #{tid2} in violent contact scuffle ({int(max_v)} px/s)"
+                            self.active_fight_pair = pair_key
+                else:
+                    if pair_key in self.pair_interactions:
+                        entry = self.pair_interactions[pair_key]
+                        time_since_contact = now - entry["last_contact"]
+
+                        # THEFT / SNATCHING PATTERN (Pairwise)
+                        if time_since_contact < 3.5:
+                            is_fleeing = (max_v >= 130.0) or (abs(v1 - v2) > 70.0 and max_v > 95.0)
+                            if (entry["had_scuffle"] or max_v > 110.0) and is_fleeing:
+                                is_theft = True
+                                self.theft_latch_until = now + 5.0
+                                flee_id = p1["track_id"] if v1 >= v2 else p2["track_id"]
+                                vict_id = p2["track_id"] if v1 >= v2 else p1["track_id"]
+
+                                item_note = "phone/valuable"
+                                for itm in items:
+                                    ic = itm["centroid"]
+                                    if math.hypot(ic[0] - c2[0], ic[1] - c2[1]) < 90 or math.hypot(ic[0] - c1[0], ic[1] - c1[1]) < 90:
+                                        item_note = str(itm["class_name"]).lower()
+                                        break
+
+                                self.theft_event_details = f"Phone/Object Snatching: Subject #{flee_id} grabbed {item_note} from #{vict_id} and sprinting away at {int(max_v)} px/s"
+                                self.active_theft_pair = pair_key
+
+                        if time_since_contact > 6.0:
+                            del self.pair_interactions[pair_key]
+
+        # Tracker-resilient Hotspot check: If any person is sprinting away from a recent scuffle hotspot
+        for p in persons:
+            p_spd = float(p.get("speed_px_s", 0.0))
+            if p_spd >= 135.0:
+                p_c = p["centroid"]
+                for hs in reversed(self.recent_contact_hotspots):
+                    if (now - hs["time"]) <= 3.5:
+                        d_from_hs = math.hypot(p_c[0] - hs["loc"][0], p_c[1] - hs["loc"][1])
+                        if d_from_hs > 50.0 and (hs["peak_v"] > 100.0 or p_spd >= 150.0):
+                            is_theft = True
+                            self.theft_latch_until = now + 5.0
+                            self.theft_event_details = f"Phone/Object Snatching: Subject #{p['track_id']} snatched item and sprinting away at {int(p_spd)} px/s"
+                            break
+
+        if now < self.theft_latch_until:
+            is_theft = True
+            theft_details = self.theft_event_details
+        if now < self.fight_latch_until:
+            is_fight = True
+            fight_details = self.fight_event_details
+
+        return is_theft, theft_details, is_fight, fight_details, interaction_links
+
     def update(
         self,
         detections: List[Dict[str, Any]],
         frame_w: int = 640,
         frame_h: int = 480,
+        timestamp: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Executes ConvLSTM spatiotemporal forward recurrence and multi-class
         human behavior analysis over detections.
         """
         t_start = time.perf_counter()
-        now = time.time()
+        now = timestamp if timestamp is not None else time.time()
         active_track_ids = set()
 
         # 1. Multi-channel Spatiotemporal Tensor (3 x 64 x 64)
@@ -562,6 +719,19 @@ class YOLOConvLSTMBehaviorAnalyzer:
                             del self.zone_entry_times[key]
                     self.fall_latches.pop(tid, None)
 
+        # 3b. Evaluate Multi-Person Spatiotemporal Interactions (Theft, Snatch, Fight)
+        person_dets = [d for d in enriched_detections if d.get("class_name") == "Person"]
+        item_dets = [d for d in enriched_detections if d.get("class_name") in ["Cell Phone", "Handbag", "Backpack", "Laptop"]]
+        is_theft, theft_desc, is_fight, fight_desc, interaction_links = self.evaluate_multi_person_interactions(
+            persons=person_dets,
+            items=item_dets,
+            now=now,
+            frame_w=frame_w,
+            frame_h=frame_h,
+        )
+        theft_events = [{"details": theft_desc, "threat": 0.94}] if is_theft else []
+        fight_events = [{"details": fight_desc, "threat": 0.90}] if is_fight else []
+
         # -------------------------------------------------------------
         # 4. Synthesize Scene-Level Primary Behavior Pattern
         # -------------------------------------------------------------
@@ -569,7 +739,15 @@ class YOLOConvLSTMBehaviorAnalyzer:
             primary_behavior = self.simulated_behavior_override
             behavior_summary = f"[TEST SIMULATION] {primary_behavior}"
             behavior_confidence = 0.95
-            if primary_behavior == "SUDDEN_FALL_COLLAPSE" and not fall_events:
+            if primary_behavior == "THEFT_SNATCHING_ROBBERY":
+                theft_events = [{"details": "Simulated Phone/Valuable Snatching in progress", "threat": 0.94}]
+                is_theft = True
+                spatiotemporal_anomaly = 0.92
+            elif primary_behavior == "PHYSICAL_STRUGGLE_FIGHT":
+                fight_events = [{"details": "Simulated Physical Altercation / Brawl in progress", "threat": 0.90}]
+                is_fight = True
+                spatiotemporal_anomaly = 0.88
+            elif primary_behavior == "SUDDEN_FALL_COLLAPSE" and not fall_events:
                 fall_events.append({"track_id": 1, "aspect_ratio": 0.65})
             elif primary_behavior == "RUNNING_FLEEING" and not running_events:
                 running_events.append({"track_id": 1, "speed_px_s": 195.0})
@@ -577,6 +755,16 @@ class YOLOConvLSTMBehaviorAnalyzer:
                 loitering_events.append({"track_id": 1, "dwell_sec": 12.5})
             elif primary_behavior == "ERRATIC_PACING" and not erratic_events:
                 erratic_events.append({"track_id": 1, "speed_px_s": 95.0})
+        elif is_theft:
+            primary_behavior = "THEFT_SNATCHING_ROBBERY"
+            behavior_summary = theft_desc or self.theft_event_details or "Robbery / Snatching: subject grabbed item and sprinting away"
+            behavior_confidence = 0.95
+            spatiotemporal_anomaly = max(spatiotemporal_anomaly, 0.92)
+        elif is_fight:
+            primary_behavior = "PHYSICAL_STRUGGLE_FIGHT"
+            behavior_summary = fight_desc or self.fight_event_details or "Physical Altercation: Subjects engaged in violent scuffle"
+            behavior_confidence = 0.91
+            spatiotemporal_anomaly = max(spatiotemporal_anomaly, 0.88)
         elif len(fall_events) > 0:
             primary_behavior = "SUDDEN_FALL_COLLAPSE"
             behavior_summary = f"Subject #{fall_events[0]['track_id']} collapsed on floor (Aspect Ratio: {fall_events[0]['aspect_ratio']})"
@@ -617,7 +805,11 @@ class YOLOConvLSTMBehaviorAnalyzer:
 
         # Calculate Threat Score
         threat_score = 0.05
-        if primary_behavior == "SUDDEN_FALL_COLLAPSE":
+        if primary_behavior == "THEFT_SNATCHING_ROBBERY":
+            threat_score = 0.94
+        elif primary_behavior == "PHYSICAL_STRUGGLE_FIGHT":
+            threat_score = 0.90
+        elif primary_behavior == "SUDDEN_FALL_COLLAPSE":
             threat_score = 0.88
         elif primary_behavior == "RUNNING_FLEEING":
             threat_score = 0.82 if len(intrusions) > 0 else 0.65
@@ -652,7 +844,10 @@ class YOLOConvLSTMBehaviorAnalyzer:
             "loitering_events": loitering_events,
             "running_events": running_events,
             "fall_events": fall_events,
+            "theft_events": theft_events,
+            "fight_events": fight_events,
             "erratic_events": erratic_events,
+            "interaction_links": interaction_links,
             "enriched_detections": enriched_detections,
             "heatmap": x_tensor[0],  # Spatial presence
             "conv_heatmap": conv_heatmap,  # Recurrent hidden activation
@@ -707,7 +902,7 @@ def draw_module2_hud(
         ar = det.get("aspect_ratio", 2.0)
 
         # Color-code bounding box based on ConvLSTM behavior
-        if state == "SUDDEN_FALL_COLLAPSE":
+        if state in ["THEFT_SNATCHING_ROBBERY", "PHYSICAL_STRUGGLE_FIGHT", "SUDDEN_FALL_COLLAPSE"]:
             box_color = (0, 0, 255)  # Bright Red
         elif state == "RUNNING_FLEEING":
             box_color = (0, 50, 255)  # Orange-Red
@@ -743,6 +938,17 @@ def draw_module2_hud(
         cv2.rectangle(canvas, (x1, sy1), (x1 + stw + 8, sy2), (18, 22, 30), -1)
         cv2.putText(canvas, sub_label, (x1 + 4, sy2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, box_color, 1, cv2.LINE_AA)
 
+    # 2b. Draw Multi-Person Interaction Proximity Lines
+    links = behavior_results.get("interaction_links", [])
+    for lk in links:
+        if lk.get("distance", 999) < 140.0:
+            c1 = tuple(map(int, lk["c1"]))
+            c2 = tuple(map(int, lk["c2"]))
+            link_col = (0, 0, 255) if lk.get("in_contact") else (0, 215, 255)
+            cv2.line(canvas, c1, c2, link_col, 1, cv2.LINE_AA)
+            mid = ((c1[0] + c2[0]) // 2, (c1[1] + c2[1]) // 2)
+            cv2.putText(canvas, f"{int(lk['distance'])}px", mid, cv2.FONT_HERSHEY_SIMPLEX, 0.36, link_col, 1, cv2.LINE_AA)
+
     # 3. Picture-in-Picture: 2D ConvLSTM Recurrent Activation Heatmap (Bottom-Right)
     conv_heat = behavior_results.get("conv_heatmap", None)
     if conv_heat is not None:
@@ -767,7 +973,7 @@ def draw_module2_hud(
     clstm_energy = behavior_results.get("convlstm_energy", 0.0)
 
     # Color code primary behavior in HUD
-    if primary_behavior_is_crit := (primary_beh in ["SUDDEN_FALL_COLLAPSE", "RUNNING_FLEEING"]):
+    if primary_beh in ["THEFT_SNATCHING_ROBBERY", "PHYSICAL_STRUGGLE_FIGHT", "SUDDEN_FALL_COLLAPSE", "RUNNING_FLEEING"]:
         beh_color = (0, 0, 255)
     elif primary_beh in ["LOITERING_LINGERING", "RESTRICTED_INTRUSION", "ERRATIC_PACING"]:
         beh_color = (0, 165, 255)
@@ -780,6 +986,18 @@ def draw_module2_hud(
     cv2.putText(canvas, hud_left, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.44, beh_color, 2, cv2.LINE_AA)
     (rw, _), _ = cv2.getTextSize(hud_right, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
     cv2.putText(canvas, hud_right, (w - rw - 10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 215, 230), 1, cv2.LINE_AA)
+
+    # 5. Prominent In-Scene Alert Banners for Active Theft / Fight
+    if primary_beh == "THEFT_SNATCHING_ROBBERY":
+        banner_overlay = canvas.copy()
+        cv2.rectangle(banner_overlay, (0, 42), (w, 75), (0, 0, 180), -1)
+        cv2.addWeighted(banner_overlay, 0.85, canvas, 0.15, 0, canvas)
+        cv2.putText(canvas, "CRITICAL ALERT: THEFT / SNATCHING DETECTED! INTERCEPT SUSPECT", (15, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2, cv2.LINE_AA)
+    elif primary_beh == "PHYSICAL_STRUGGLE_FIGHT":
+        banner_overlay = canvas.copy()
+        cv2.rectangle(banner_overlay, (0, 42), (w, 75), (0, 50, 200), -1)
+        cv2.addWeighted(banner_overlay, 0.85, canvas, 0.15, 0, canvas)
+        cv2.putText(canvas, "URGENT ALERT: PHYSICAL ALTERCATION / FIGHT IN PROGRESS", (15, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2, cv2.LINE_AA)
 
     return canvas
 
@@ -897,6 +1115,8 @@ def get_telemetry():
 def simulate_behavior(mode: str = Query(...)):
     """Injects or simulates a specific behavioral pattern for interactive testbenches."""
     mode_map = {
+        "snatch": "THEFT_SNATCHING_ROBBERY",
+        "fight": "PHYSICAL_STRUGGLE_FIGHT",
         "fall": "SUDDEN_FALL_COLLAPSE",
         "run": "RUNNING_FLEEING",
         "loiter": "LOITERING_LINGERING",

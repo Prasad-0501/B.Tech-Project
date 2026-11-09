@@ -195,6 +195,20 @@ class LLMCognitiveDispatcher:
                 "decided_action": "LOCKDOWN_ALL_SECTORS_AND_DISPATCH_ARMED_SECURITY" if weapons else "LOCK_SECTOR_DOORS_AND_SOUND_ALARM",
                 "dispatch_brief": "Initiate emergency facility lockdown. Seal sector access doors. Alert Armed Tactical Response.",
             }
+        elif conv_beh == "THEFT_SNATCHING_ROBBERY" or rule_id.startswith("R02B"):
+            return {
+                "incident_type": "THEFT_SNATCHING_ROBBERY_IN_PROGRESS",
+                "human_reasoning": f"ConvLSTM multi-agent spatiotemporal kinematics detected physical snatching robbery ({beh_summary}). High-speed interpersonal closure and scuffle followed by immediate escape sprint.",
+                "decided_action": "ALERT_SECURITY_THEFT_IN_PROGRESS_AND_INTERCEPT_FLEEING_SUSPECT",
+                "dispatch_brief": "CRITICAL SECURITY ALERT: Phone/item snatching in progress! Intercept fleeing suspect and render assistance.",
+            }
+        elif conv_beh == "PHYSICAL_STRUGGLE_FIGHT" or rule_id.startswith("R02C"):
+            return {
+                "incident_type": "PHYSICAL_ALTERCATION_FIGHT",
+                "human_reasoning": f"ConvLSTM multi-person interaction kinematics detected aggressive physical fight / struggle ({beh_summary}). Sustained close-proximity grapple with chaotic acceleration spikes.",
+                "decided_action": "DISPATCH_SECURITY_PATROL",
+                "dispatch_brief": "URGENT: Physical altercation / brawl in progress in monitored sector. Dispatch security patrol immediately.",
+            }
         elif conv_beh == "SUDDEN_FALL_COLLAPSE" or rule_id.startswith("R07A"):
             return {
                 "incident_type": "MEDICAL_EMERGENCY_SUBJECT_COLLAPSE",
@@ -539,6 +553,8 @@ def force_reason():
 def simulate_behavior(mode: str = Query(...)):
     """Injects or tests a specific behavioral pattern in ConvLSTM."""
     mode_map = {
+        "snatch": "THEFT_SNATCHING_ROBBERY",
+        "fight": "PHYSICAL_STRUGGLE_FIGHT",
         "fall": "SUDDEN_FALL_COLLAPSE",
         "run": "RUNNING_FLEEING",
         "loiter": "LOITERING_LINGERING",
@@ -688,6 +704,8 @@ def index_page():
           <button class="btn btn-audio" onclick="simulateBehavior('run')">🏃 Sprint / Fleeing</button>
           <button class="btn btn-audio" onclick="simulateBehavior('loiter')">⏳ Restricted Loitering</button>
           <button class="btn btn-primary" style="background:#991b1b;border-color:#ef4444;" onclick="simulateBehavior('fall')">🚨 Sudden Fall / Collapse</button>
+          <button class="btn btn-primary" style="background:#7f1d1d;border-color:#f43f5e;" onclick="simulateBehavior('snatch')">🥷 Snatch / Robbery</button>
+          <button class="btn btn-audio" style="border-color:#f97316;" onclick="simulateBehavior('fight')">🥊 Fight / Altercation</button>
           <button class="btn btn-audio" onclick="simulateBehavior('erratic')">⚡ Erratic Pacing</button>
           <button class="btn" onclick="simulateBehavior('reset')">🔄 Clear</button>
         </div>
@@ -863,7 +881,7 @@ setInterval(async () => {{
 
       const badge = document.getElementById('behaviorStatusBadge');
       const bVal = document.getElementById('convBehaviorVal');
-      if (bName === 'SUDDEN_FALL_COLLAPSE') {{
+      if (bName === 'THEFT_SNATCHING_ROBBERY' || bName === 'PHYSICAL_STRUGGLE_FIGHT' || bName === 'SUDDEN_FALL_COLLAPSE') {{
         badge.style.color = '#ef4444';
         bVal.style.color = '#ef4444';
       }} else if (bName === 'RUNNING_FLEEING' || bName === 'LOITERING_LINGERING') {{
