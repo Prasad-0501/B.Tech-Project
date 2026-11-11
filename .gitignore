@@ -23,3 +23,7 @@ database/snapshots/*.png
 .idea/
 .DS_Store
 Thumbs.db
+
+# Scratch & Temporary
+scratch/
+

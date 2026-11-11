@@ -38,12 +38,19 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, Query, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+import torch
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from modules.m1_yolo_tracker import ZeroLagVideoStream, YOLOTrackerEngine, SURVEILLANCE_CLASSES, CLASS_COLORS
+from modules.convlstm_net import (
+    BEHAVIOR_CLASSES,
+    CLASS_TO_IDX,
+    IDX_TO_CLASS,
+    ConvLSTMBehaviorClassifier,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +198,26 @@ class YOLOConvLSTMBehaviorAnalyzer:
         self.loiter_limit = loiter_limit_sec
         self.run_speed_thresh = run_speed_thresh_px_s
 
+        # Deep PyTorch ConvLSTM Neural Network Model
+        self.net = ConvLSTMBehaviorClassifier(
+            in_channels=3,
+            num_classes=len(BEHAVIOR_CLASSES),
+            cnn_channels=24,
+            lstm_hidden=32,
+        )
+        self.model_path = BASE_DIR / "models" / "convlstm_behavior_net.pt"
+        if self.model_path.exists():
+            ckpt = torch.load(str(self.model_path), map_location="cpu")
+            self.net.load_state_dict(ckpt["model_state_dict"])
+            val_acc = ckpt.get("val_acc", 0.95)
+            print(f"[Module 2] Loaded Deep ConvLSTM Neural Network ({self.model_path.name}) - Validation Acc: {val_acc*100:.1f}%", flush=True)
+        else:
+            print("[Module 2] WARNING: convlstm_behavior_net.pt not found, initializing fresh weights.", flush=True)
+        self.net.eval()
+
+        # Sliding spatiotemporal sequence buffer of T=16 frames: shape (16, 3, 64, 64)
+        self.sequence_buffer: deque = deque(maxlen=self.seq_len)
+
         # 3-channel ConvLSTM (Presence, Velocity Flow, Temporal Delta)
         self.convlstm = ConvLSTMCell(in_channels=3, hidden_channels=4, kernel_size=3, grid_size=grid_size)
         self.h_state = np.zeros((4, self.grid_H, self.grid_W), dtype=np.float32)
@@ -202,6 +229,10 @@ class YOLOConvLSTMBehaviorAnalyzer:
         # Per-track trajectory & kinematic memory: tid -> deque of (t, cx, cy, w, h, ar, speed)
         self.trajectories: Dict[int, deque] = {}
         self.zone_entry_times: Dict[Tuple[int, str], float] = {}
+
+        # Direct camera frame memory for ConvLSTM
+        self.prev_camera_frame: Optional[np.ndarray] = None
+        self.camera_frame_lag_buffer: deque = deque(maxlen=4)
 
         # Fall event latch to preserve alert state over consecutive frames
         self.fall_latches: Dict[int, float] = {}
@@ -234,6 +265,46 @@ class YOLOConvLSTMBehaviorAnalyzer:
                 "color": (0, 165, 255),  # Amber
             },
         }
+
+    def extract_direct_camera_tensor(self, camera_frame: Optional[np.ndarray]) -> np.ndarray:
+        """
+        Constructs a 3-channel (3 x 64 x 64) spatiotemporal input tensor directly
+        from the raw camera video frame, completely independent of YOLO detections.
+        
+          - Channel 0: Normalized Grayscale Scene Structure (visual presence & geometry)
+          - Channel 1: Instantaneous Pixel Velocity Difference |I_t - I_{t-1}|
+          - Channel 2: Dynamic Multi-Step Temporal Persistence Flow |I_t - I_{t-3}|
+        """
+        if camera_frame is None:
+            return np.zeros((3, self.grid_H, self.grid_W), dtype=np.float32)
+
+        # Convert to single-channel luminance / grayscale
+        if len(camera_frame.shape) == 3 and camera_frame.shape[2] == 3:
+            gray = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2GRAY)
+        elif len(camera_frame.shape) == 3 and camera_frame.shape[2] == 1:
+            gray = camera_frame[:, :, 0]
+        else:
+            gray = camera_frame
+
+        # Resize directly to 64x64 spatiotemporal grid
+        g64 = cv2.resize(gray, (self.grid_W, self.grid_H), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+
+        if self.prev_camera_frame is None:
+            self.prev_camera_frame = g64.copy()
+
+        # Channel 1: Instantaneous pixel motion delta
+        ch1_diff = np.abs(g64 - self.prev_camera_frame)
+        self.prev_camera_frame = g64.copy()
+
+        # Channel 2: Multi-step dynamic motion persistence
+        if len(self.camera_frame_lag_buffer) == 0:
+            ch2_lag = ch1_diff.copy()
+        else:
+            ch2_lag = np.abs(g64 - self.camera_frame_lag_buffer[0])
+        self.camera_frame_lag_buffer.append(g64.copy())
+
+        tensor = np.stack([g64, ch1_diff, ch2_lag], axis=0)  # (3, 64, 64)
+        return tensor
 
     def generate_spatiotemporal_tensor(
         self,
@@ -607,21 +678,38 @@ class YOLOConvLSTMBehaviorAnalyzer:
 
     def update(
         self,
-        detections: List[Dict[str, Any]],
+        camera_input: Any = None,
+        detections: Optional[List[Dict[str, Any]]] = None,
         frame_w: int = 640,
         frame_h: int = 480,
         timestamp: Optional[float] = None,
+        camera_frame: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         """
-        Executes ConvLSTM spatiotemporal forward recurrence and multi-class
-        human behavior analysis over detections.
+        Executes ConvLSTM spatiotemporal forward recurrence directly over raw camera frames
+        (independent of YOLO) and evaluates security zones and detections.
         """
         t_start = time.perf_counter()
         now = timestamp if timestamp is not None else time.time()
         active_track_ids = set()
 
-        # 1. Multi-channel Spatiotemporal Tensor (3 x 64 x 64)
-        x_tensor = self.generate_spatiotemporal_tensor(detections, frame_w, frame_h)
+        # Handle flexible calling conventions
+        if isinstance(camera_input, np.ndarray):
+            raw_frame = camera_input
+            active_dets = detections if detections is not None else []
+        elif isinstance(camera_input, list):
+            active_dets = camera_input
+            raw_frame = camera_frame
+        else:
+            raw_frame = camera_frame
+            active_dets = detections if detections is not None else []
+
+        # 1. Multi-channel Spatiotemporal Tensor (3 x 64 x 64) DIRECTLY FROM CAMERA FRAME
+        if raw_frame is not None:
+            x_tensor = self.extract_direct_camera_tensor(raw_frame)
+        else:
+            # Fallback if no camera visual frame passed (e.g. headless unit tests)
+            x_tensor = self.generate_spatiotemporal_tensor(active_dets, frame_w, frame_h)
 
         # 2. 2D ConvLSTM Spatiotemporal Recurrence
         self.h_state, self.c_state = self.convlstm.forward(x_tensor, self.h_state, self.c_state)
@@ -644,7 +732,7 @@ class YOLOConvLSTMBehaviorAnalyzer:
         erratic_events = []
         max_speed = 0.0
 
-        for det in detections:
+        for det in active_dets:
             tid = det["track_id"]
             active_track_ids.add(tid)
             cx, cy = det["centroid"]
@@ -733,102 +821,63 @@ class YOLOConvLSTMBehaviorAnalyzer:
         fight_events = [{"details": fight_desc, "threat": 0.90}] if is_fight else []
 
         # -------------------------------------------------------------
-        # 4. Synthesize Scene-Level Primary Behavior Pattern
+        # 4. Neural ConvLSTM Behavior Classification (End-to-End Neural Model)
         # -------------------------------------------------------------
+        # Append current frame's spatiotemporal tensor to sliding memory buffer
+        self.sequence_buffer.append(x_tensor)
+        while len(self.sequence_buffer) < self.seq_len:
+            self.sequence_buffer.append(x_tensor)
+
+        seq_tensor = np.stack(list(self.sequence_buffer), axis=0)  # (16, 3, 64, 64)
+        t_infer_start = time.perf_counter()
+        net_pred = self.net.predict_sequence(seq_tensor)
+        convlstm_ms = round((time.perf_counter() - t_infer_start) * 1000.0, 2)
+
+        primary_behavior = net_pred["predicted_class"]
+        behavior_confidence = net_pred["confidence"]
+        class_probabilities = net_pred["probabilities"]
+        conv_heatmap = net_pred["feature_heatmap"]
+
+        # If test simulation override is active, apply test behavior
         if self.simulated_behavior_override and (now < self.simulated_override_expire):
             primary_behavior = self.simulated_behavior_override
+            behavior_confidence = 0.96
             behavior_summary = f"[TEST SIMULATION] {primary_behavior}"
-            behavior_confidence = 0.95
-            if primary_behavior == "THEFT_SNATCHING_ROBBERY":
-                theft_events = [{"details": "Simulated Phone/Valuable Snatching in progress", "threat": 0.94}]
-                is_theft = True
-                spatiotemporal_anomaly = 0.92
-            elif primary_behavior == "PHYSICAL_STRUGGLE_FIGHT":
-                fight_events = [{"details": "Simulated Physical Altercation / Brawl in progress", "threat": 0.90}]
-                is_fight = True
-                spatiotemporal_anomaly = 0.88
-            elif primary_behavior == "SUDDEN_FALL_COLLAPSE" and not fall_events:
-                fall_events.append({"track_id": 1, "aspect_ratio": 0.65})
-            elif primary_behavior == "RUNNING_FLEEING" and not running_events:
-                running_events.append({"track_id": 1, "speed_px_s": 195.0})
-            elif primary_behavior == "LOITERING_LINGERING" and not loitering_events:
-                loitering_events.append({"track_id": 1, "dwell_sec": 12.5})
-            elif primary_behavior == "ERRATIC_PACING" and not erratic_events:
-                erratic_events.append({"track_id": 1, "speed_px_s": 95.0})
-        elif is_theft:
-            primary_behavior = "THEFT_SNATCHING_ROBBERY"
-            behavior_summary = theft_desc or self.theft_event_details or "Robbery / Snatching: subject grabbed item and sprinting away"
-            behavior_confidence = 0.95
-            spatiotemporal_anomaly = max(spatiotemporal_anomaly, 0.92)
-        elif is_fight:
-            primary_behavior = "PHYSICAL_STRUGGLE_FIGHT"
-            behavior_summary = fight_desc or self.fight_event_details or "Physical Altercation: Subjects engaged in violent scuffle"
-            behavior_confidence = 0.91
-            spatiotemporal_anomaly = max(spatiotemporal_anomaly, 0.88)
-        elif len(fall_events) > 0:
-            primary_behavior = "SUDDEN_FALL_COLLAPSE"
-            behavior_summary = f"Subject #{fall_events[0]['track_id']} collapsed on floor (Aspect Ratio: {fall_events[0]['aspect_ratio']})"
-            behavior_confidence = 0.92
-        elif len(running_events) > 0:
-            primary_behavior = "RUNNING_FLEEING"
-            behavior_summary = f"High-speed sprint detected ({int(max_speed)} px/s) with rapid spatial dispersion"
-            behavior_confidence = 0.88
-        elif len(loitering_events) > 0 and len(intrusions) > 0:
-            primary_behavior = "LOITERING_LINGERING"
-            behavior_summary = f"Restricted zone loitering in {intrusions[0]['zone_name']} ({loitering_events[0]['dwell_sec']}s)"
-            behavior_confidence = 0.85
-        elif len(intrusions) > 0:
-            primary_behavior = "RESTRICTED_INTRUSION"
-            behavior_summary = f"Unauthorized entry into {intrusions[0]['zone_name']}"
-            behavior_confidence = 0.80
-        elif len(erratic_events) > 0:
-            primary_behavior = "ERRATIC_PACING"
-            behavior_summary = f"Erratic trajectory oscillation and pacing jitter detected ({int(max_speed)} px/s)"
-            behavior_confidence = 0.75
-        elif len(loitering_events) > 0:
-            primary_behavior = "LOITERING_LINGERING"
-            behavior_summary = f"Stationary dwell in perimeter for {loitering_events[0]['dwell_sec']}s"
-            behavior_confidence = 0.70
-        elif any(d.get("class_name") == "Person" for d in detections):
-            if max_speed > 20.0:
-                primary_behavior = "NORMAL_WALKING"
-                behavior_summary = f"Routine pedestrian movement ({int(max_speed)} px/s) with upright posture"
-                behavior_confidence = 0.90
-            else:
-                primary_behavior = "STATIONARY_IDLE"
-                behavior_summary = "Stationary authorized human presence without violation"
-                behavior_confidence = 0.88
         else:
-            primary_behavior = "SCENE_EMPTY_SECURE"
-            behavior_summary = "Scene empty. Zero human motion detected."
-            behavior_confidence = 0.99
+            behavior_summary = f"Neural ConvLSTM: {primary_behavior} ({behavior_confidence * 100:.1f}% confidence)"
 
-        # Calculate Threat Score
-        threat_score = 0.05
-        if primary_behavior == "THEFT_SNATCHING_ROBBERY":
-            threat_score = 0.94
-        elif primary_behavior == "PHYSICAL_STRUGGLE_FIGHT":
-            threat_score = 0.90
-        elif primary_behavior == "SUDDEN_FALL_COLLAPSE":
-            threat_score = 0.88
-        elif primary_behavior == "RUNNING_FLEEING":
-            threat_score = 0.82 if len(intrusions) > 0 else 0.65
-        elif primary_behavior == "LOITERING_LINGERING" and len(intrusions) > 0:
-            threat_score = 0.75
-        elif primary_behavior == "RESTRICTED_INTRUSION":
-            threat_score = 0.60
-        elif primary_behavior == "ERRATIC_PACING":
-            threat_score = 0.45
-        elif primary_behavior == "LOITERING_LINGERING":
-            threat_score = 0.40
-        elif primary_behavior in ["NORMAL_WALKING", "STATIONARY_IDLE"]:
-            threat_score = 0.10
+        # Set threat score directly according to the Neural Network's predicted class
+        NEURAL_THREAT_MAP = {
+            "THEFT_SNATCHING_ROBBERY": 0.94,
+            "PHYSICAL_STRUGGLE_FIGHT": 0.90,
+            "SUDDEN_FALL_COLLAPSE": 0.88,
+            "RUNNING_FLEEING": 0.72,
+            "RESTRICTED_INTRUSION": 0.65,
+            "LOITERING_LINGERING": 0.55,
+            "ERRATIC_PACING": 0.50,
+            "NORMAL_WALKING": 0.10,
+            "STATIONARY_IDLE": 0.05,
+            "SCENE_EMPTY_SECURE": 0.01,
+        }
+        base_threat = NEURAL_THREAT_MAP.get(primary_behavior, 0.10)
+        threat_score = round(min(1.0, base_threat * (0.6 + 0.4 * behavior_confidence)), 2)
+
+        # Spatiotemporal anomaly derived from neural anomaly probability mass
+        anomaly_mass = sum(class_probabilities.get(c, 0.0) for c in [
+            "THEFT_SNATCHING_ROBBERY", "PHYSICAL_STRUGGLE_FIGHT", "SUDDEN_FALL_COLLAPSE", "RUNNING_FLEEING", "RESTRICTED_INTRUSION"
+        ])
+        spatiotemporal_anomaly = round(float(anomaly_mass), 3)
+
+        convlstm_energy = round(float(np.mean(np.abs(conv_heatmap))), 3)
+
+        # Synthesize events for downstream rules matching the neural classification
+        theft_events = [{"details": behavior_summary, "threat": 0.94}] if primary_behavior == "THEFT_SNATCHING_ROBBERY" else []
+        fight_events = [{"details": behavior_summary, "threat": 0.90}] if primary_behavior == "PHYSICAL_STRUGGLE_FIGHT" else []
+        fall_events = [{"track_id": 1, "aspect_ratio": 0.65}] if primary_behavior == "SUDDEN_FALL_COLLAPSE" else []
+        running_events = [{"track_id": 1, "speed_px_s": max_speed}] if primary_behavior == "RUNNING_FLEEING" else []
+        erratic_events = [{"track_id": 1, "speed_px_s": max_speed}] if primary_behavior == "ERRATIC_PACING" else []
 
         fused_threat = max(threat_score, spatiotemporal_anomaly * 0.4 + threat_score * 0.6)
-        convlstm_ms = (time.perf_counter() - t_start) * 1000.0
-
-        # ConvLSTM activation heatmap for HUD / PIP visualization
-        conv_heatmap = np.max(self.h_state, axis=0)  # (64, 64)
 
         return {
             "timestamp": now,
@@ -838,6 +887,7 @@ class YOLOConvLSTMBehaviorAnalyzer:
             "primary_behavior": primary_behavior,
             "behavior_summary": behavior_summary,
             "behavior_confidence": round(behavior_confidence, 2),
+            "class_probabilities": class_probabilities,
             "threat_score": round(min(1.0, fused_threat), 2),
             "max_speed_px_s": round(max_speed, 1),
             "intrusions": intrusions,

@@ -414,9 +414,9 @@ def mjpeg_generator():
         raw_dets = state.detections if hasattr(state, "detections") else state[0]
         vis_ms = state.inference_ms if hasattr(state, "inference_ms") else state[1]
 
-        # 2. ConvLSTM Behavior (Module 2)
+        # 2. ConvLSTM Behavior (Module 2) - Fed directly with camera frame!
         fw, fh = frame.shape[1], frame.shape[0]
-        b_data = BEHAVIOR.update(raw_dets, frame_w=fw, frame_h=fh)
+        b_data = BEHAVIOR.update(camera_frame=frame, detections=raw_dets, frame_w=fw, frame_h=fh)
 
         # 3. Audio Intelligence (Module 3)
         a_data = AUDIO_MGR.get_state()
@@ -490,7 +490,7 @@ def get_telemetry():
     frame = pkt.image if pkt is not None else None
     fw = frame.shape[1] if frame is not None else 640
     fh = frame.shape[0] if frame is not None else 480
-    b_data = BEHAVIOR.update(raw_dets, frame_w=fw, frame_h=fh)
+    b_data = BEHAVIOR.update(camera_frame=frame, detections=raw_dets, frame_w=fw, frame_h=fh)
     a_data = AUDIO_MGR.get_state()
 
     # Rule Fusion
@@ -513,7 +513,9 @@ def get_telemetry():
         "telemetry": f_res["inputs_summary"],
         # ConvLSTM Spatiotemporal Behavior
         "convlstm_behavior": b_data.get("primary_behavior", "NORMAL_WALKING"),
+        "convlstm_confidence": b_data.get("behavior_confidence", 0.0),
         "behavior_summary": b_data.get("behavior_summary", ""),
+        "class_probabilities": b_data.get("class_probabilities", {}),
         "spatiotemporal_anomaly": b_data.get("spatiotemporal_anomaly", 0.0),
         "convlstm_ms": b_data.get("convlstm_ms", 0.0),
         "convlstm_energy": b_data.get("convlstm_energy", 0.0),

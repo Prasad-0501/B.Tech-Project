@@ -113,10 +113,10 @@ def mjpeg_generator():
         raw_dets = state.detections if hasattr(state, "detections") else state[0]
         inf_ms = state.inference_ms if hasattr(state, "inference_ms") else state[1]
 
-        # 2. Spatiotemporal Behavior (ConvLSTM)
+        # 2. Spatiotemporal Behavior (ConvLSTM) - Fed directly with camera frame!
         fw = frame.shape[1]
         fh = frame.shape[0]
-        b_data = BEHAVIOR.update(raw_dets, frame_w=fw, frame_h=fh)
+        b_data = BEHAVIOR.update(camera_frame=frame, detections=raw_dets, frame_w=fw, frame_h=fh)
 
         # 3. Audio AI (Google YAMNet)
         a_data = AUDIO_MGR.get_state()

@@ -42,8 +42,8 @@ def test_uploaded_video():
         # 1. Vision & Tracking
         dets = tracker.detect_frame(frame, use_tracking=True)
 
-        # 2. ConvLSTM Spatiotemporal Behavior Engine
-        b_data = analyzer.update(dets, frame_w=w, frame_h=h, timestamp=t_sec)
+        # 2. ConvLSTM Spatiotemporal Behavior Engine - Fed directly with camera frame!
+        b_data = analyzer.update(camera_frame=frame, detections=dets, frame_w=w, frame_h=h, timestamp=t_sec)
 
         # 3. Dummy Audio (silent background for video test)
         a_data = {
